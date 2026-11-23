@@ -1,0 +1,21 @@
+[Unit]
+Description=Janus voice bridge — Armada leg + mixer (Discord<->Armada)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Build with `cargo build --release` and copy target/release/janus-armada
+# to ~/.local/bin/ (or adjust the path).
+ExecStart=%h/.local/bin/janus-armada
+EnvironmentFile=%h/.config/janus/janus.env
+# Socket lives under the runtime dir (BRIDGE_SOCKET_PATH points here).
+RuntimeDirectory=janus
+Restart=on-failure
+RestartSec=5
+# The daemon is pure audio transport; keep its blast radius small.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Janus voice bridge — Discord leg (Discord<->Armada)
+After=network-online.target janus-armada.service
+Wants=network-online.target
+Requires=janus-armada.service
+
+[Service]
+Type=simple
+# Adjust if you cloned the repo somewhere else.
+WorkingDirectory=%h/janus-armada-discord-bridge/discord-leg
+# Node 22+. If your node lives elsewhere (nvm, ~/.local/bin), use that
+# absolute path — systemd does not search PATH for ExecStart.
+ExecStart=/usr/bin/node src/index.mjs
+EnvironmentFile=%h/.config/janus/janus.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

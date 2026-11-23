@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/concord-voice",
+    "crates/pcm-protocol",
+    "armada-leg",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+# The host is a modest laptop CPU; keep the release build
+# reasonable rather than maximally optimized.
+opt-level = 2

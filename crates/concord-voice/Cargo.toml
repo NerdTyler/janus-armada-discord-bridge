@@ -1,0 +1,40 @@
+[package]
+name = "concord-voice"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Concord (Armada) voice transport: CORD-07 broker grant, kind-23313 presence, LiveKit SFU session with per-sender AES-256-GCM frame E2EE and the RFC 4571 ICE-TCP bridge. Lifted from the reference bot's live-proven src/livekit module."
+
+[dependencies]
+# Same SDK stack the reference bot runs (the derivations, chat-plane sealing
+# and transport all live in vector-core; the bridge holds its own
+# community membership through the same facade). nostr-sdk is
+# pinned with `=` in lockstep with vector_sdk, exactly as in
+# the reference bot's tree — a loose spec silently drifts off the SDK's types.
+vector_sdk = { version = "0.12", features = ["voice"] }
+nostr-sdk = "=0.45.6"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+anyhow = "1"
+hex = "0.4"
+base64 = "0.22"
+
+# LiveKit SFU session (identical set to the reference bot's leg): pure-Rust
+# signaling (livekit-protocol protobufs over WebSocket) +
+# webrtc-rs media + hand-rolled CORD-07 frame cryptor. NOT the
+# official `livekit` crate (its native cryptor derives AES-128
+# keys and cannot produce Armada-compatible frames).
+livekit-protocol = "0.8.2"
+prost = "0.14"
+bytes = "1"
+webrtc = "0.17.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+url = "2"
+futures-util = "0.3"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+mousiki = "0.2.1"
+rand = "0.8"

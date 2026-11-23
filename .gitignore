@@ -1,0 +1,14 @@
+# Build artifacts
+/target
+**/target
+node_modules
+
+# Secrets & local config — only the .example ships
+*.env
+!bridge.env.example
+janus.env
+
+# Backups, logs, runtime state
+*.bak*
+*.log
+data/
