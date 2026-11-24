@@ -1202,6 +1202,23 @@ async fn run_publisher(
     }
 }
 
+/// The track reader's Opus decoders (48 kHz mono + stereo),
+/// FFI libopus via the `opus` crate — NOT mousiki. Measured
+/// 2026-11-23 (spot-tone sweep through the real code paths):
+/// mousiki's ENCODER bitstream is flat to 16 kHz (proven by
+/// decoding it with libopus), but mousiki's DECODER is the
+/// "Xbox Live from MW2" choke point — mono output falls off
+/// a cliff above ~6 kHz (−11…−39 dB at 7–16 kHz) and stereo
+/// output is ragged −15…−31 dB nearly everywhere above
+/// 500 Hz. libopus decode of the same packets is flat
+/// (±0.2 dB, 250 Hz–16 kHz, both channel counts). The
+/// publisher keeps the mousiki encoder; only decode moved.
+fn build_decoders() -> Option<(opus::Decoder, opus::Decoder)> {
+    let mono = opus::Decoder::new(48_000, opus::Channels::Mono).ok()?;
+    let stereo = opus::Decoder::new(48_000, opus::Channels::Stereo).ok()?;
+    Some((mono, stereo))
+}
+
 /// Read one remote track to its end: decrypt, decode, reframe
 /// to the bridge's 20 ms clock, and hand each frame to the
 /// mixer sink tagged with the participant's SFU identity.
@@ -1212,14 +1229,9 @@ async fn run_track_reader(
     sink: mpsc::UnboundedSender<(String, Vec<i16>)>,
     stop: Arc<AtomicBool>,
 ) {
-    let dec_mono = mousiki::DecoderBuilder::new(48_000, mousiki::Channels::Mono).build();
-    let dec_stereo = mousiki::DecoderBuilder::new(48_000, mousiki::Channels::Stereo).build();
-    let (mut dec_mono, mut dec_stereo) = match (dec_mono, dec_stereo) {
-        (Ok(m), Ok(s)) => (m, s),
-        _ => {
-            warn!("[janus] opus decoder failed to build for {identity}");
-            return;
-        }
+    let Some((mut dec_mono, mut dec_stereo)) = build_decoders() else {
+        warn!("[janus] opus decoder failed to build for {identity}");
+        return;
     };
     let mut carry: Vec<i16> = Vec::new();
     let mut decode_buf = vec![0i16; 5760 * 2];
@@ -1275,6 +1287,97 @@ async fn run_track_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goertzel magnitude at `freq` over samples[start..end]
+    /// (the measurement the 2026-11-23 audio harness used).
+    fn goertzel(samples: &[i16], freq: f64, start: usize, end: usize) -> f64 {
+        let seg = &samples[start..end.min(samples.len())];
+        let n = seg.len() as f64;
+        let k = freq * n / 48_000.0;
+        let w = 2.0 * std::f64::consts::PI * k / n;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in seg {
+            let s = x as f64 + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt() / n
+    }
+
+    fn tone_gain_db(freq: f64, input: &[i16], output: &[i16]) -> f64 {
+        let start = 3 * FRAME_SAMPLES;
+        let gin = goertzel(input, freq, start, input.len() - FRAME_SAMPLES);
+        let gout = goertzel(output, freq, start, output.len() - FRAME_SAMPLES);
+        20.0 * (gout / gin).log10()
+    }
+
+    /// REGRESSION (2026-11-23, "Xbox Live from MW2"): the
+    /// production decoders must pass high frequencies. The
+    /// old mousiki decoder measured −11…−39 dB at 7–16 kHz
+    /// mono and −15…−31 dB stereo; libopus is flat. If this
+    /// test fails, someone put a band-limiting decoder back.
+    #[test]
+    fn production_decoders_pass_high_frequencies() {
+        let (mut dec_mono, mut dec_stereo) = build_decoders().expect("decoders build");
+        // Mono: packets from the production publisher encoder
+        // (mousiki, 48 kHz mono Voip 64 kbps).
+        let mut enc = mousiki::EncoderBuilder::new(48_000, mousiki::Channels::Mono, mousiki::Application::Voip)
+            .bitrate(mousiki::Bitrate::Bits(64_000))
+            .build()
+            .expect("mousiki enc");
+        for freq in [1_000.0f64, 8_000.0, 12_000.0] {
+            let mut input: Vec<i16> = Vec::new();
+            let mut output: Vec<i16> = Vec::new();
+            let mut buf = vec![0i16; 5760];
+            for f in 0..15 {
+                let frame: Vec<i16> = (0..FRAME_SAMPLES)
+                    .map(|i| {
+                        let t = (f * FRAME_SAMPLES + i) as f64 / 48_000.0;
+                        (12_000.0 * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16
+                    })
+                    .collect();
+                input.extend_from_slice(&frame);
+                let pkt = enc.encode_vec(&frame, 4000).expect("encode");
+                let n = dec_mono.decode(&pkt, &mut buf, false).expect("decode");
+                output.extend_from_slice(&buf[..n]);
+            }
+            let db = tone_gain_db(freq, &input, &output);
+            assert!(db > -3.0, "mono {freq} Hz gain {db:.1} dB — decoder is band-limiting");
+        }
+        // Stereo: packets from a libopus stereo encoder (what
+        // real stereo clients send), decoded + downmixed the
+        // way run_track_reader does it.
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+            .expect("ffi enc");
+        enc.set_bitrate(opus::Bitrate::Bits(64_000)).expect("bitrate");
+        for freq in [1_000.0f64, 8_000.0] {
+            let mut input: Vec<i16> = Vec::new();
+            let mut output: Vec<i16> = Vec::new();
+            let mut buf = vec![0i16; 5760 * 2];
+            for f in 0..15 {
+                let mut frame: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+                let mut mono_frame: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
+                for i in 0..FRAME_SAMPLES {
+                    let t = (f * FRAME_SAMPLES + i) as f64 / 48_000.0;
+                    let s = (12_000.0 * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16;
+                    frame.push(s);
+                    frame.push(s);
+                    mono_frame.push(s);
+                }
+                input.extend_from_slice(&mono_frame);
+                let pkt = enc.encode_vec(&frame, 4000).expect("encode");
+                let n = dec_stereo.decode(&pkt, &mut buf, false).expect("decode");
+                output.extend(
+                    buf[..n * 2]
+                        .chunks_exact(2)
+                        .map(|pair| ((pair[0] as i32 + pair[1] as i32) / 2) as i16),
+                );
+            }
+            let db = tone_gain_db(freq, &input, &output);
+            assert!(db > -3.0, "stereo {freq} Hz gain {db:.1} dB — decoder is band-limiting");
+        }
+    }
 
     #[test]
     fn opus_pt_parsed_from_sdp() {

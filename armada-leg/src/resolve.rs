@@ -128,21 +128,6 @@ pub fn humans_only(
         .collect()
 }
 
-/// Parse a per-direction master gain env value (decibels,
-/// BRIDGE_GAIN_TO_DISCORD_DB / BRIDGE_GAIN_TO_ARMADA_DB)
-/// into the linear multiplier the mixer applies. Unset,
-/// unparseable, or non-finite → the default. Clamped to
-/// [-60, +12] dB so a typo can neither mute the bridge
-/// outright nor deafen anyone. Pure — unit-tested.
-pub fn parse_gain_db(raw: Option<&str>, default_db: f32) -> f32 {
-    let db = raw
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(default_db)
-        .clamp(-60.0, 12.0);
-    10f32.powf(db / 20.0)
-}
-
 /// Whether a live session should end for emptiness
 /// : ONLY when no humans remain
 /// in EITHER channel of the session — both sides known
@@ -281,26 +266,6 @@ mod tests {
         // Unknown Discord occupancy never ends a session:
         // missing data is not an empty room.
         assert!(!should_end_for_emptiness(0, None));
-    }
-
-    #[test]
-    fn gain_db_parsing_defaults_values_and_clamps() {
-        let lin = |db: f32| 10f32.powf(db / 20.0);
-        // Unset -> the direction's default (deployment:
-        // -6 dB to Discord, -3 dB to Armada).
-        assert!((parse_gain_db(None, -6.0) - lin(-6.0)).abs() < 1e-6);
-        assert!((parse_gain_db(None, -3.0) - lin(-3.0)).abs() < 1e-6);
-        // Set values are honored, whitespace tolerated.
-        assert!((parse_gain_db(Some("-6"), -3.0) - 0.501_187_2).abs() < 1e-5);
-        assert!((parse_gain_db(Some(" -3 "), -6.0) - 0.707_945_8).abs() < 1e-5);
-        assert!((parse_gain_db(Some("0"), -6.0) - 1.0).abs() < 1e-6);
-        // Garbage / non-finite -> default, never a panic or NaN gain.
-        assert!((parse_gain_db(Some("loud"), -6.0) - lin(-6.0)).abs() < 1e-6);
-        assert!((parse_gain_db(Some("NaN"), -6.0) - lin(-6.0)).abs() < 1e-6);
-        assert!((parse_gain_db(Some("inf"), -6.0) - lin(-6.0)).abs() < 1e-6);
-        // Out-of-range values clamp to [-60, +12] dB.
-        assert!((parse_gain_db(Some("-120"), -6.0) - lin(-60.0)).abs() < 1e-6);
-        assert!((parse_gain_db(Some("30"), -6.0) - lin(12.0)).abs() < 1e-4);
     }
 
     #[test]

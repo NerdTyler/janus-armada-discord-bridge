@@ -35,6 +35,32 @@ pub const MAX_FRAME_LEN: usize = 64 * 1024;
 pub const JITTER_TARGET: usize = 3;
 /// Jitter buffer max depth (frames) per source: 200 ms.
 pub const JITTER_MAX: usize = 10;
+/// Underrun ride-through (2026-11-23, diagnosis round 2):
+/// when a flowing source's buffer runs dry for a tick, the
+/// buffer emits a concealment frame (the last real frame,
+/// decayed) instead of going silent and demanding a full
+/// re-prebuffer. At most this many consecutive ticks
+/// (5 × 20 ms = 100 ms) are ridden through; a source dry
+/// longer than that has genuinely stopped and re-prebuffers
+/// as before. Rationale, measured in
+/// tests/robotic_harness.rs: the Discord receive path has
+/// NO packet-loss concealment anywhere — @discordjs/voice
+/// pushes received packets in arrival order with no
+/// sequence check, and prism decodes what it gets, so one
+/// lost packet compresses the decoded timeline by 20 ms.
+/// Against a fixed 20 ms mixer tick the per-source buffer
+/// then drains at the loss rate and, as built, ONE 20 ms
+/// hole became a ≥60 ms mute (underrun + 3-frame
+/// re-prebuffer): 26 hole events / 1000 ms of silence per
+/// 3 min of speech at 1% packet loss. Ride-through
+/// eliminated every measured hole in every scenario
+/// (0–2% loss, jitter spikes, simulated CPU stalls,
+/// two speakers) at zero added latency.
+pub const UNDERRUN_RIDE: usize = 5;
+/// Per-tick amplitude decay of concealment frames
+/// (0.7, 0.49, 0.34, …): a fading repeat, like standard
+/// Opus PLC, not a frozen loop.
+pub const CONCEAL_DECAY: f32 = 0.7;
 /// Ring capacity for socket write queues (frames): 200 ms.
 pub const RING_CAPACITY: usize = 10;
 
@@ -299,18 +325,37 @@ impl<T> DropRing<T> {
 
 /// One source's jitter buffer: frames arrive off the network
 /// clock and leave on the mixer tick. Output starts once
-/// JITTER_TARGET frames are buffered (60 ms of cushion); a
-/// source that underruns contributes silence for that tick
-/// and re-enters prebuffering only if it runs fully dry —
-/// small gaps are ridden out, not re-cushioned.
+/// JITTER_TARGET frames are buffered (60 ms of cushion).
+/// A brief underrun (≤ UNDERRUN_RIDE ticks) is ridden
+/// through with a decayed repeat of the last frame —
+/// packet-loss concealment for a receive path that has
+/// none (see UNDERRUN_RIDE) — instead of muting the source
+/// until it re-prebuffers. Only a source dry longer than
+/// the ride window re-enters prebuffering.
 pub struct JitterBuffer {
     ring: DropRing<Vec<i16>>,
     started: bool,
+    /// Last real frame popped (concealment source material).
+    last: Option<Vec<i16>>,
+    /// Concealment ticks left before giving up.
+    ride_left: usize,
+    /// Ticks this buffer has concealed (telemetry).
+    pub concealed: u64,
+    /// Ticks this buffer underran past the ride window and
+    /// fell silent mid-flow (telemetry).
+    pub underruns: u64,
 }
 
 impl JitterBuffer {
     pub fn new() -> Self {
-        Self { ring: DropRing::new(JITTER_MAX), started: false }
+        Self {
+            ring: DropRing::new(JITTER_MAX),
+            started: false,
+            last: None,
+            ride_left: 0,
+            concealed: 0,
+            underruns: 0,
+        }
     }
 
     pub fn push(&mut self, frame: Vec<i16>) {
@@ -321,15 +366,32 @@ impl JitterBuffer {
     }
 
     /// One frame for this tick, or None when this source
-    /// contributes silence (prebuffering or underrun).
+    /// contributes silence (prebuffering, or dry past the
+    /// ride-through window).
     pub fn pop_for_tick(&mut self) -> Option<Vec<i16>> {
         if !self.started {
             return None;
         }
         match self.ring.pop() {
-            Some(f) => Some(f),
+            Some(f) => {
+                self.last = Some(f.clone());
+                self.ride_left = UNDERRUN_RIDE;
+                Some(f)
+            }
             None => {
+                if self.ride_left > 0 {
+                    if let Some(last) = &self.last {
+                        self.ride_left -= 1;
+                        self.concealed += 1;
+                        let ride_idx = (UNDERRUN_RIDE - self.ride_left) as i32;
+                        let decay = CONCEAL_DECAY.powi(ride_idx);
+                        return Some(
+                            last.iter().map(|s| (*s as f32 * decay) as i16).collect(),
+                        );
+                    }
+                }
                 self.started = false;
+                self.underruns += 1;
                 None
             }
         }
@@ -361,79 +423,38 @@ pub enum Side {
 
 /// The bridge mixer: owns both directions' inputs and the
 /// 20 ms tick. On each tick, each direction sums its active
-/// inputs (i32 accumulate, optional per-input gain), applies
-/// the direction's master gain, and finishes through the
-/// soft limiter ([`soft_limit`]) — the final level stage.
+/// inputs (i32 accumulate) at UNITY — no gain staging, no
+/// limiter — and the only level safety is the last-resort
+/// hard clamp at full scale on the way out. (The 2026-11-22
+/// per-direction master gains + tanh soft limiter were
+/// removed 2026-11-23 on the owner's order: unity passthrough.)
 /// A direction with no input producing audio this
 /// tick yields None — the legs publish nothing rather than
 /// streaming digital silence.
 pub struct Mixer {
     inputs: HashMap<(Side, u64), JitterBuffer>,
-    gains: HashMap<(Side, u64), f32>,
-    /// Per-direction master gains (linear), named by where
-    /// the audio is HEADED. Default 1.0 (unity); the Armada
-    /// leg sets them from BRIDGE_GAIN_TO_*_DB at startup
-    /// (the bridge ran unity end to end,
-    /// so overlapping near-full-scale sources flat-topped).
-    gain_to_discord: f32,
-    gain_to_armada: f32,
     /// Speaking edges emitted by the last tick:
     /// (side, speaker_id, started).
     speaking_edges: Vec<(Side, u64, bool)>,
     active: HashMap<(Side, u64), bool>,
     pub dropped_frames: u64,
-}
-
-/// The soft limiter's ceiling: ≈ -1 dBFS (10^(-1/20)).
-/// No mixed sample ever exceeds it, however hot the sum.
-pub const LIMIT_CEILING: f32 = 0.891_250_9;
-
-/// Where the limiter stops being perfectly linear:
-/// -6 dBFS. Below the knee a sample passes untouched.
-pub const LIMIT_KNEE: f32 = 0.5;
-
-/// Soft-knee saturation (tanh), the mixer's final stage.
-/// Linear below [`LIMIT_KNEE`]; above it, a tanh segment
-/// with matching value and slope at the knee, asymptotic
-/// to ±[`LIMIT_CEILING`] — overlaps compress gracefully
-/// instead of flat-topping at i16::MAX the way the old
-/// hard clamp did. Input/output are normalized (1.0 =
-/// full scale); the input may exceed 1.0 (a hot sum).
-pub fn soft_limit(s: f32) -> f32 {
-    let a = s.abs();
-    if a <= LIMIT_KNEE {
-        return s;
-    }
-    let y = LIMIT_KNEE
-        + (LIMIT_CEILING - LIMIT_KNEE) * ((a - LIMIT_KNEE) / (LIMIT_CEILING - LIMIT_KNEE)).tanh();
-    y.copysign(s)
+    /// Concealment frames emitted by underrun ride-through
+    /// across all inputs (telemetry; see UNDERRUN_RIDE).
+    pub concealed_frames: u64,
+    /// Ticks an input stayed silent past the ride window
+    /// mid-flow across all inputs (telemetry).
+    pub underrun_ticks: u64,
 }
 
 impl Mixer {
     pub fn new() -> Self {
         Self {
             inputs: HashMap::new(),
-            gains: HashMap::new(),
-            gain_to_discord: 1.0,
-            gain_to_armada: 1.0,
             speaking_edges: Vec::new(),
             active: HashMap::new(),
             dropped_frames: 0,
-        }
-    }
-
-    /// Per-input gain trim (config; default 1.0).
-    pub fn set_gain(&mut self, side: Side, speaker_id: u64, gain: f32) {
-        self.gains.insert((side, speaker_id), gain);
-    }
-
-    /// Per-direction master gain (config; default 1.0),
-    /// named by the direction the audio is headed TO. Applied
-    /// to the summed frame, before the soft limiter.
-    pub fn set_master_gain(&mut self, destination: Side, gain: f32) {
-        match destination {
-            Side::Discord => self.gain_to_discord = gain,
-            Side::Armada => self.gain_to_armada = gain,
+            concealed_frames: 0,
+            underrun_ticks: 0,
         }
     }
 
@@ -461,21 +482,27 @@ impl Mixer {
     /// side's inputs, or None when that direction had no
     /// audio this tick.
     pub fn tick(&mut self) -> (Option<Vec<i16>>, Option<Vec<i16>>) {
-        let to_discord = self.mix_direction(Side::Armada, self.gain_to_discord);
-        let to_armada = self.mix_direction(Side::Discord, self.gain_to_armada);
+        let to_discord = self.mix_direction(Side::Armada);
+        let to_armada = self.mix_direction(Side::Discord);
         (to_discord, to_armada)
     }
 
-    /// Sum one direction: all inputs from `source_side`,
-    /// finished with the direction's master gain and the
-    /// soft limiter (the final level stage).
-    fn mix_direction(&mut self, source_side: Side, master_gain: f32) -> Option<Vec<i16>> {
+    /// Sum one direction: all inputs from `source_side` at
+    /// unity, finished with the last-resort hard clamp at
+    /// full scale (the pre-loudness-fix behavior).
+    fn mix_direction(&mut self, source_side: Side) -> Option<Vec<i16>> {
         let mut acc: Option<[i32; FRAME_SAMPLES]> = None;
         let mut any_audio = false;
         let keys: Vec<(Side, u64)> =
             self.inputs.keys().filter(|(s, _)| *s == source_side).copied().collect();
         for key in keys {
-            let frame = self.inputs.get_mut(&key).and_then(|b| b.pop_for_tick());
+            let mut frame = None;
+            if let Some(b) = self.inputs.get_mut(&key) {
+                let (c0, u0) = (b.concealed, b.underruns);
+                frame = b.pop_for_tick();
+                self.concealed_frames += b.concealed - c0;
+                self.underrun_ticks += b.underruns - u0;
+            }
             let speaking = frame
                 .as_ref()
                 .map(|f| frame_level(f) >= SPEAKING_LEVEL)
@@ -486,10 +513,9 @@ impl Mixer {
             }
             if let Some(frame) = frame {
                 any_audio = true;
-                let gain = self.gains.get(&key).copied().unwrap_or(1.0);
                 let acc = acc.get_or_insert([0i32; FRAME_SAMPLES]);
                 for (i, s) in frame.iter().take(FRAME_SAMPLES).enumerate() {
-                    acc[i] += (*s as f32 * gain) as i32;
+                    acc[i] += *s as i32;
                 }
             }
         }
@@ -497,11 +523,7 @@ impl Mixer {
             return None;
         }
         let acc = acc.unwrap_or([0i32; FRAME_SAMPLES]);
-        Some(
-            acc.iter()
-                .map(|v| (soft_limit((*v as f32 / 32768.0) * master_gain) * 32768.0) as i16)
-                .collect(),
-        )
+        Some(acc.iter().map(|v| (*v).clamp(-32768, 32767) as i16).collect())
     }
 
     /// Speaking start/stop edges since the last call.
@@ -621,16 +643,85 @@ mod tests {
         assert!(j.pop_for_tick().is_none(), "still prebuffering at 2");
         j.push(f.clone());
         assert!(j.pop_for_tick().is_some(), "flows at target depth");
-        // Drain fully: next tick underruns and re-prebuffers.
+        // Drain fully: the buffer first rides through the
+        // underrun with concealment (UNDERRUN_RIDE ticks),
+        // THEN falls silent and re-prebuffers.
         let _ = j.pop_for_tick();
         let _ = j.pop_for_tick();
-        assert!(j.pop_for_tick().is_none());
+        for _ in 0..UNDERRUN_RIDE {
+            assert!(j.pop_for_tick().is_some(), "ride-through conceals brief underruns");
+        }
+        assert!(j.pop_for_tick().is_none(), "silent once the ride window is spent");
         j.push(f.clone());
         assert!(j.pop_for_tick().is_none(), "re-prebuffers after running dry");
     }
 
     #[test]
-    fn mixer_sums_limits_and_separates_directions() {
+    fn jitter_buffer_concealment_decays_and_real_frames_take_over() {
+        let mut j = JitterBuffer::new();
+        let f = vec![10_000i16; FRAME_SAMPLES];
+        for _ in 0..JITTER_TARGET {
+            j.push(f.clone());
+        }
+        for _ in 0..JITTER_TARGET {
+            let _ = j.pop_for_tick();
+        }
+        // First dry tick: concealment = last frame at 0.7.
+        let c1 = j.pop_for_tick().expect("first concealment tick");
+        assert!(c1.iter().all(|s| *s == 7_000), "concealment decays: {c1:?}…");
+        // Second dry tick: 0.49.
+        let c2 = j.pop_for_tick().expect("second concealment tick");
+        assert!(c2.iter().all(|s| *s == 4_900));
+        assert_eq!(j.concealed, 2);
+        // A real frame arriving mid-ride is played as itself
+        // on the next tick, not papered over.
+        j.push(f.clone());
+        let r = j.pop_for_tick().expect("real frame after concealment");
+        assert!(r.iter().all(|s| *s == 10_000));
+        assert_eq!(j.concealed, 2, "no concealment counted for real frames");
+    }
+
+    #[test]
+    fn mixer_no_silence_gap_when_one_frame_goes_missing() {
+        // REGRESSION (2026-11-23, "tiny bit robotic
+        // occasionally"): the Discord receive path delivers
+        // a timeline compressed by every lost packet (no
+        // concealment upstream). As built, one missing 20 ms
+        // frame drained the jitter buffer and the source
+        // went silent for the underrun tick PLUS the 3-frame
+        // re-prebuffer — a ≥60 ms hole per lost packet,
+        // measured at 26 holes/1000 ms per 3 min of speech
+        // at 1% loss (tests/robotic_harness.rs). With
+        // ride-through, the mixed output must have NO silent
+        // tick while the source is mid-spurt.
+        let mut m = Mixer::new();
+        let f = vec![8_000i16; FRAME_SAMPLES];
+        // Prebuffer + start flowing (ring now holds 2).
+        for _ in 0..JITTER_TARGET {
+            m.push(Side::Discord, 7, f.clone());
+        }
+        let (_, ta) = m.tick();
+        assert!(ta.is_some(), "flowing");
+        // Steady state, one frame in per tick, except ticks
+        // 2, 5, 8 whose frames were "lost in the network".
+        // Each loss permanently drains the cushion by one
+        // (the upstream timeline compresses — nothing ever
+        // re-fills it), so the third loss empties the ring
+        // mid-spurt: as built, that tick and the following
+        // re-prebuffer ticks were silent.
+        for tick in 0..10 {
+            if tick % 3 != 2 {
+                m.push(Side::Discord, 7, f.clone());
+            }
+            let (_, ta) = m.tick();
+            assert!(ta.is_some(), "tick {tick}: mid-spurt output must not gap");
+        }
+        assert_eq!(m.concealed_frames, 1, "exactly the drained tick was concealed");
+        assert_eq!(m.underrun_ticks, 0, "no underrun got past the ride window");
+    }
+
+    #[test]
+    fn mixer_sums_clamps_and_separates_directions() {
         let mut m = Mixer::new();
         let loud = vec![30_000i16; FRAME_SAMPLES];
         // Two Discord speakers, loud enough to clip when summed.
@@ -640,68 +731,44 @@ mod tests {
             m.push(Side::Armada, 9, vec![1000i16; FRAME_SAMPLES]);
         }
         let (to_discord, to_armada) = m.tick();
-        // Discord hears ONLY the Armada input (mix-minus), and
-        // a small signal passes the limiter untouched (it is
-        // below the knee): direction separation AND the old
-        // unity path both preserved.
+        // Discord hears ONLY the Armada input (mix-minus),
+        // passed through at unity.
         let td = to_discord.expect("armada audio flows to discord");
         assert!(td.iter().all(|s| *s == 1000));
-        // Armada hears the Discord sum — but through the soft
-        // limiter now: it must NOT pin at i16::MAX (the old
-        // hard clamp flat-topped here) and must respect the
-        // -1 dBFS ceiling while still landing near it (two
-        // near-full-scale sources sum well past the knee).
+        // Armada hears the Discord sum: 30000 + 30000 = 60000,
+        // held by the last-resort hard clamp at full scale —
+        // the ONLY level stage left in the mixer (the master
+        // gains and tanh limiter were removed 2026-11-23).
         let ta = to_armada.expect("discord audio flows to armada");
-        let ceiling = (LIMIT_CEILING * 32768.0) as i16;
-        assert!(ta.iter().all(|s| *s <= ceiling && *s != i16::MAX));
-        assert!(ta.iter().all(|s| *s > 28_000), "hot sum should ride near the ceiling: {}", ta[0]);
+        assert!(ta.iter().all(|s| *s == i16::MAX));
     }
 
     #[test]
-    fn soft_limiter_ceiling_and_knee() {
-        // Below the knee: perfectly linear, both signs.
-        assert_eq!(soft_limit(0.25), 0.25);
-        assert_eq!(soft_limit(-0.5), -0.5);
-        assert_eq!(soft_limit(0.0), 0.0);
-        // At full scale and far beyond: never over the
-        // ceiling, approaching it as the sum grows,
-        // symmetric, never at 1.0.
-        assert!(soft_limit(1.0) > 0.80 && soft_limit(1.0) < LIMIT_CEILING);
-        for s in [2.0f32, 10.0, 100.0] {
-            let y = soft_limit(s);
-            assert!(y <= LIMIT_CEILING && y > 0.88, "s={s} y={y}");
-            assert_eq!(soft_limit(-s), -y);
-        }
-    }
-
-    #[test]
-    fn mixer_master_gain_scales_a_single_input() {
-        // -6 dB ≈ 0.5012 linear (the BRIDGE_GAIN_TO_DISCORD_DB
-        // default, applied by the armada leg at startup).
+    fn mixer_hard_clamp_bounds_both_signs() {
         let mut m = Mixer::new();
-        m.set_master_gain(Side::Discord, 0.501_187_2);
-        m.set_master_gain(Side::Armada, 0.707_945_8); // -3 dB
         for _ in 0..JITTER_TARGET {
-            m.push(Side::Armada, 9, vec![10_000i16; FRAME_SAMPLES]);
-            m.push(Side::Discord, 1, vec![10_000i16; FRAME_SAMPLES]);
+            m.push(Side::Discord, 1, vec![-30_000i16; FRAME_SAMPLES]);
+            m.push(Side::Discord, 2, vec![-30_000i16; FRAME_SAMPLES]);
         }
-        let (to_discord, to_armada) = m.tick();
-        // 10000 * 0.5012 ≈ 5012; the product stays below the
-        // limiter knee, so it passes at exactly the gain.
-        let td = to_discord.unwrap();
-        assert!(td.iter().all(|s| (5012 - *s as i32).abs() <= 2), "to_discord {}", td[0]);
-        // The other direction carries its OWN gain (-3 dB):
-        // gains are per-direction, not global.
-        let ta = to_armada.unwrap();
-        assert!(ta.iter().all(|s| (7079 - *s as i32).abs() <= 2), "to_armada {}", ta[0]);
-        // Default (unset) master gain is unity: a moderate
-        // single input passes unchanged.
-        let mut m2 = Mixer::new();
-        for _ in 0..JITTER_TARGET {
-            m2.push(Side::Armada, 9, vec![10_000i16; FRAME_SAMPLES]);
+        let (_, ta) = m.tick();
+        assert!(ta.unwrap().iter().all(|s| *s == i16::MIN));
+    }
+
+    #[test]
+    fn mixer_is_unity_passthrough() {
+        // No gain staging anywhere: a single input at any
+        // level below full scale passes bit-exact, both
+        // directions, both signs.
+        for level in [1i16, 1000, 10_000, 30_000, -1, -10_000, -30_000, i16::MAX, i16::MIN] {
+            let mut m = Mixer::new();
+            for _ in 0..JITTER_TARGET {
+                m.push(Side::Armada, 9, vec![level; FRAME_SAMPLES]);
+                m.push(Side::Discord, 1, vec![level; FRAME_SAMPLES]);
+            }
+            let (td, ta) = m.tick();
+            assert!(td.unwrap().iter().all(|s| *s == level), "to_discord at {level}");
+            assert!(ta.unwrap().iter().all(|s| *s == level), "to_armada at {level}");
         }
-        let (td2, _) = m2.tick();
-        assert!(td2.unwrap().iter().all(|s| *s == 10_000));
     }
 
     #[test]

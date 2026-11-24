@@ -719,6 +719,7 @@ dependencies = [
  "log",
  "mousiki",
  "nostr-sdk",
+ "opus",
  "prost",
  "rand 0.8.5",
  "serde",

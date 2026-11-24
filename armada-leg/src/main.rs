@@ -40,7 +40,7 @@ use pcm_protocol::{
     fnv1a_64, Frame, FrameType, Mixer, Side, StreamDecoder, FRAME_SAMPLES,
 };
 use resolve::{
-    humans_only, is_voice_channel, parse_gain_db, resolve_landing, should_end_for_emptiness,
+    humans_only, is_voice_channel, resolve_landing, should_end_for_emptiness,
     snapshot_summary, ChannelOccupancy, Landing,
 };
 use serde_json::{json, Value};
@@ -78,14 +78,6 @@ struct Config {
     /// music starts, is the deployment case. Janus himself
     /// is always excluded separately (channel_occupants).
     bot_npubs: HashSet<String>,
-    /// Per-direction master gains (linear), parsed from
-    /// BRIDGE_GAIN_TO_DISCORD_DB (default -6 dB) and
-    /// BRIDGE_GAIN_TO_ARMADA_DB (default -3 dB) and applied
-    /// to the mixer at startup (the owner, 2026-11-22 — the
-    /// bridge ran unity end to end and hot overlaps
-    /// flat-topped). Tunable via janus.env + restart.
-    gain_to_discord: f32,
-    gain_to_armada: f32,
     default_voice_channel: Option<String>,
     text_channel: Option<String>,
     /// Chat-visible session start/stop announcements
@@ -112,8 +104,6 @@ impl Config {
             auth::build_whitelist(owner_npub.as_deref(), env("ARMADA_SUMMON_NPUBS").as_deref());
         let bot_npubs: HashSet<String> =
             auth::parse_id_list(env("ARMADA_BOT_NPUBS").as_deref()).into_iter().collect();
-        let gain_to_discord = parse_gain_db(env("BRIDGE_GAIN_TO_DISCORD_DB").as_deref(), -6.0);
-        let gain_to_armada = parse_gain_db(env("BRIDGE_GAIN_TO_ARMADA_DB").as_deref(), -3.0);
         Self {
             socket_path: env("BRIDGE_SOCKET_PATH")
                 .unwrap_or_else(|| format!("{runtime}/janus/pcm.sock")),
@@ -124,8 +114,6 @@ impl Config {
             summon_access,
             summon_whitelist,
             bot_npubs,
-            gain_to_discord,
-            gain_to_armada,
             default_voice_channel: env("ARMADA_VOICE_CHANNEL_ID"),
             text_channel: env("ARMADA_TEXT_CHANNEL_ID"),
             announce: env("JANUS_ANNOUNCE")
@@ -242,16 +230,8 @@ impl App {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cfg = Arc::new(Config::from_env());
-    let mut mixer = Mixer::new();
-    mixer.set_master_gain(Side::Discord, cfg.gain_to_discord);
-    mixer.set_master_gain(Side::Armada, cfg.gain_to_armada);
-    info!(
-        "[janus] master gains: to-discord {:.4} ({:.1} dB), to-armada {:.4} ({:.1} dB), soft limiter ceiling ≈ -1 dBFS",
-        cfg.gain_to_discord,
-        20.0 * cfg.gain_to_discord.log10(),
-        cfg.gain_to_armada,
-        20.0 * cfg.gain_to_armada.log10(),
-    );
+    let mixer = Mixer::new();
+    info!("[janus] audio path: unity passthrough (no gain staging, no limiter; hard clamp at full scale only)");
     let app = Arc::new(App {
         cfg: cfg.clone(),
         shared: Mutex::new(Shared::new()),
@@ -398,8 +378,27 @@ async fn mixer_tick(app: Arc<App>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seq: u32 = 0;
     let start = std::time::Instant::now();
+    // Mixer telemetry (2026-11-23): the drop/conceal/underrun
+    // counters existed but were never read, which is why the
+    // loss-driven underrun defect (diagnosis round 2) was
+    // invisible in the journal. Surface them every 30 s
+    // whenever they moved.
+    let mut ticks: u64 = 0;
+    let mut last_telemetry = (0u64, 0u64, 0u64);
     loop {
         ticker.tick().await;
+        ticks += 1;
+        if ticks % 1500 == 0 {
+            let m = app.mixer.lock().unwrap();
+            let now = (m.dropped_frames, m.concealed_frames, m.underrun_ticks);
+            if now != last_telemetry {
+                info!(
+                    "[janus] mixer telemetry: dropped={} concealed={} underruns={}",
+                    now.0, now.1, now.2
+                );
+                last_telemetry = now;
+            }
+        }
         let (to_discord, to_armada) = {
             let mut mixer = app.mixer.lock().unwrap();
             let out = mixer.tick();

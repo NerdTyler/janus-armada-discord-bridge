@@ -37,4 +37,10 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 mousiki = "0.2.1"
+# FFI libopus — used for DECODE only (see session.rs
+# build_decoders): mousiki's encoder bitstream measures
+# flat to 16 kHz, but its DECODER band-limits (mono cliff
+# above ~6 kHz; stereo ragged almost everywhere), which is
+# the 2026-11-23 "Xbox Live from MW2" quality defect.
+opus = "0.4"
 rand = "0.8"
