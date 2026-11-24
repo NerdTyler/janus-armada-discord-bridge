@@ -37,12 +37,12 @@ Wire protocol: [`shared/pcm-protocol.md`](shared/pcm-protocol.md).
   companion bot (e.g. a music bot) can auto-summon Janus when its music
   starts — post `janus join <channel>` from the bot — and the bridge
   stays up for the humans listening, not for the bot.
-- **Per-direction gain controls + soft limiter.** The bridge has no
-  AGC: a raw mic feed arrives hotter than Discord's processed natives,
-  and summed sources flat-top. `BRIDGE_GAIN_TO_DISCORD_DB` /
-  `BRIDGE_GAIN_TO_ARMADA_DB` set master gains per direction, and the
-  mixer finishes through a tanh soft limiter (≈ −1 dBFS ceiling)
-  instead of a hard clamp.
+- **Unity audio path.** The mixer sums at unity — no gain staging,
+  no limiter — with only a last-resort hard clamp at full scale.
+  Incoming Armada audio is decoded with libopus (fullband, flat to
+  16 kHz), and the jitter buffer rides through brief dropouts with
+  decayed-frame concealment instead of muting, so a lost packet
+  doesn't become an audible hole.
 - **Optional session announcements.** With `JANUS_ANNOUNCE=on`, Janus
   posts a short note in both platforms' text channels when a session
   starts/stops (worth doing: while the bridge is up, audio leaves both
