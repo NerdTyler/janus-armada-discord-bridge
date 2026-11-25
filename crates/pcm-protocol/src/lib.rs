@@ -19,7 +19,7 @@
 //! a bounded drop-oldest ring; audio that is 200 ms late is
 //! worse than no audio.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Samples per 20 ms frame at 48 kHz.
 pub const FRAME_SAMPLES: usize = 960;
@@ -284,6 +284,17 @@ pub fn frame_level(pcm: &[i16]) -> f32 {
     pcm.iter().map(|s| (*s as i32).unsigned_abs()).max().unwrap_or(0) as f32 / i16::MAX as f32
 }
 
+/// RMS level of a frame, 0..1 (ducking speech detection —
+/// RMS tracks perceived loudness better than peak, which a
+/// single click or pop can trip).
+pub fn frame_rms(pcm: &[i16]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = pcm.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+    ((sum / pcm.len() as f64).sqrt() / i16::MAX as f64) as f32
+}
+
 /// A bounded drop-oldest ring: the only queue shape this
 /// protocol allows. Overflow drops the OLDEST item and counts
 /// the drop — audio too late is worse than no audio.
@@ -421,13 +432,101 @@ pub enum Side {
     Armada,
 }
 
+/// Ducking configuration (the owner's order, 2026-11-24):
+/// sources marked as MUSIC get their gain ridden by an
+/// envelope that pulls them down while any HUMAN source on
+/// the same side is speaking, so people always sit on top
+/// of the music in the mix. Human sources are NEVER
+/// envelope-reduced — the only gain a human source can get
+/// is its manual per-stream gain (see [`Mixer::set_manual_gain`]),
+/// which is a deliberate, chat-commanded setting, not
+/// something the envelope does to them.
+#[derive(Clone, Debug)]
+pub struct DuckConfig {
+    /// Master switch (JANUS_DUCK=off in the daemon).
+    pub enabled: bool,
+    /// Gain music sources are ducked TO (0.30 = 30%).
+    pub gain: f32,
+    /// Ramp down to `gain` over this many ms.
+    pub attack_ms: u32,
+    /// Stay ducked this many ms after the last speech-active
+    /// human frame before releasing.
+    pub hold_ms: u32,
+    /// Ramp back to unity over this many ms.
+    pub release_ms: u32,
+    /// A human frame at or above this RMS (0..1) counts as
+    /// speech and (re)engages the duck.
+    pub rms_on: f32,
+    /// Hysteresis: speech is considered over only once
+    /// every human frame falls to this RMS or below.
+    /// Between the two thresholds the previous state holds,
+    /// so a voice hovering at the edge cannot flap the duck.
+    pub rms_off: f32,
+    /// Sources that start out marked as music (the daemon
+    /// seeds stable-id sources here — Discord user ids —
+    /// and marks Armada sources at runtime once presence
+    /// resolves their identity to a music npub, because
+    /// Armada SFU identities are random per join).
+    pub music_sources: HashSet<(Side, u64)>,
+}
+
+impl Default for DuckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gain: 0.30,
+            attack_ms: 100,
+            hold_ms: 1500,
+            release_ms: 1000,
+            rms_on: 0.02,
+            rms_off: 0.01,
+            music_sources: HashSet::new(),
+        }
+    }
+}
+
+/// One side's duck envelope state.
+#[derive(Clone, Copy)]
+struct DuckState {
+    /// Current envelope gain for the side's music sources.
+    gain: f32,
+    /// Hysteresis latch: a human on this side is speaking.
+    speaking: bool,
+    /// Ticks of hold left after speech stops.
+    hold_left: u32,
+}
+
+impl Default for DuckState {
+    fn default() -> Self {
+        Self { gain: 1.0, speaking: false, hold_left: 0 }
+    }
+}
+
+/// Step `cur` toward `target` by at most `step`.
+fn move_toward(cur: f32, target: f32, step: f32) -> f32 {
+    if cur < target {
+        (cur + step).min(target)
+    } else {
+        (cur - step).max(target)
+    }
+}
+
 /// The bridge mixer: owns both directions' inputs and the
 /// 20 ms tick. On each tick, each direction sums its active
-/// inputs (i32 accumulate) at UNITY — no gain staging, no
-/// limiter — and the only level safety is the last-resort
-/// hard clamp at full scale on the way out. (The 2026-11-22
-/// per-direction master gains + tanh soft limiter were
-/// removed 2026-11-23 on the owner's order: unity passthrough.)
+/// inputs (i32 accumulate) and the only level safety is the
+/// last-resort hard clamp at full scale on the way out.
+/// Sources sum at UNITY unless a gain says otherwise; the
+/// gains that exist are exactly two (both the owner's orders,
+/// 2026-11-24 — the 2026-11-22 master gains + tanh limiter
+/// stayed removed):
+///   - a per-source MANUAL gain (0–150%, default 100%),
+///     set from Armada chat by the owner alone (`!vol …`), and
+///   - the DUCK envelope, which rides MUSIC sources only,
+///     down under same-side human speech.
+/// Effective gain = manual × envelope (music) or manual
+/// alone (humans). With no manual gains set and no music
+/// sources marked, the mixer is the same bit-exact unity
+/// passthrough it was before.
 /// A direction with no input producing audio this
 /// tick yields None — the legs publish nothing rather than
 /// streaming digital silence.
@@ -437,6 +536,14 @@ pub struct Mixer {
     /// (side, speaker_id, started).
     speaking_edges: Vec<(Side, u64, bool)>,
     active: HashMap<(Side, u64), bool>,
+    duck_cfg: DuckConfig,
+    /// Per-side duck envelope state.
+    duck: HashMap<Side, DuckState>,
+    /// Sources currently marked as music (duckable).
+    music: HashSet<(Side, u64)>,
+    /// Per-source manual gains (absent = 1.0). Runtime
+    /// state only: cleared with the session, never stored.
+    manual: HashMap<(Side, u64), f32>,
     pub dropped_frames: u64,
     /// Concealment frames emitted by underrun ride-through
     /// across all inputs (telemetry; see UNDERRUN_RIDE).
@@ -448,10 +555,19 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new() -> Self {
+        Self::with_duck_config(DuckConfig::default())
+    }
+
+    pub fn with_duck_config(duck_cfg: DuckConfig) -> Self {
+        let music = duck_cfg.music_sources.clone();
         Self {
             inputs: HashMap::new(),
             speaking_edges: Vec::new(),
             active: HashMap::new(),
+            duck_cfg,
+            duck: HashMap::new(),
+            music,
+            manual: HashMap::new(),
             dropped_frames: 0,
             concealed_frames: 0,
             underrun_ticks: 0,
@@ -466,15 +582,131 @@ impl Mixer {
         self.dropped_frames += buf.dropped() - before;
     }
 
-    /// Forget a source entirely (participant left).
+    /// Forget a source entirely (participant left) — its
+    /// manual gain and music mark go with it.
     pub fn remove(&mut self, side: Side, speaker_id: u64) {
         self.inputs.remove(&(side, speaker_id));
         self.active.remove(&(side, speaker_id));
+        self.manual.remove(&(side, speaker_id));
+        self.music.remove(&(side, speaker_id));
     }
 
     pub fn clear(&mut self) {
         self.inputs.clear();
         self.active.clear();
+        self.manual.clear();
+        self.music = self.duck_cfg.music_sources.clone();
+        self.duck.clear();
+    }
+
+    // -- gains ------------------------------------------------
+
+    /// Mark (or unmark) a source as music: music sources
+    /// are ridden by the duck envelope; every other source
+    /// is human and never is.
+    pub fn set_music_source(&mut self, side: Side, speaker_id: u64, music: bool) {
+        if music {
+            self.music.insert((side, speaker_id));
+        } else {
+            self.music.remove(&(side, speaker_id));
+        }
+    }
+
+    pub fn is_music_source(&self, side: Side, speaker_id: u64) -> bool {
+        self.music.contains(&(side, speaker_id))
+    }
+
+    /// A source's manual gain (1.0 when never set).
+    pub fn manual_gain(&self, side: Side, speaker_id: u64) -> f32 {
+        self.manual.get(&(side, speaker_id)).copied().unwrap_or(1.0)
+    }
+
+    /// Set a source's manual gain, clamped to 0.0–1.5
+    /// (silence through a 50% boost). Applies from the next
+    /// tick; composes multiplicatively with the duck
+    /// envelope for music sources.
+    pub fn set_manual_gain(&mut self, side: Side, speaker_id: u64, gain: f32) {
+        let gain = gain.clamp(0.0, 1.5);
+        if (gain - 1.0).abs() < f32::EPSILON {
+            self.manual.remove(&(side, speaker_id));
+        } else {
+            self.manual.insert((side, speaker_id), gain);
+        }
+    }
+
+    /// One source's manual gain back to 1.0.
+    pub fn reset_manual_gain(&mut self, side: Side, speaker_id: u64) {
+        self.manual.remove(&(side, speaker_id));
+    }
+
+    /// Every source's manual gain back to 1.0.
+    pub fn reset_all_manual_gains(&mut self) {
+        self.manual.clear();
+    }
+
+    /// The live input sources, sorted for stable display.
+    pub fn sources(&self) -> Vec<(Side, u64)> {
+        let mut out: Vec<(Side, u64)> = self.inputs.keys().copied().collect();
+        out.sort_by_key(|(side, id)| (matches!(side, Side::Armada) as u8, *id));
+        out
+    }
+
+    /// The current duck envelope gain for a side's music
+    /// sources (1.0 when idle or ducking is disabled).
+    /// Telemetry/tests.
+    pub fn duck_gain(&self, side: Side) -> f32 {
+        if !self.duck_cfg.enabled {
+            return 1.0;
+        }
+        self.duck.get(&side).map(|s| s.gain).unwrap_or(1.0)
+    }
+
+    /// Advance one side's duck envelope by one tick, based
+    /// on THIS tick's popped frames, and return the gain to
+    /// apply to the side's music sources in this tick's mix.
+    /// Speech state is a hysteresis latch over the side's
+    /// HUMAN sources: any human frame at/above `rms_on`
+    /// engages (and refreshes the hold); speech reads as
+    /// over only when every human frame is at/below
+    /// `rms_off`. Music sources never trigger their own
+    /// duck, and a side with no music sources still tracks
+    /// state harmlessly (the gain is simply never used).
+    fn step_duck(&mut self, side: Side, frames: &[((Side, u64), Option<Vec<i16>>)]) -> f32 {
+        let cfg = &self.duck_cfg;
+        if !cfg.enabled {
+            return 1.0;
+        }
+        let mut any_on = false;
+        let mut all_off = true;
+        for (key, frame) in frames {
+            if self.music.contains(key) {
+                continue;
+            }
+            let rms = frame.as_ref().map(|f| frame_rms(f)).unwrap_or(0.0);
+            if rms >= cfg.rms_on {
+                any_on = true;
+            }
+            if rms > cfg.rms_off {
+                all_off = false;
+            }
+        }
+        let st = self.duck.entry(side).or_default();
+        if any_on {
+            st.speaking = true;
+        } else if all_off {
+            st.speaking = false;
+        }
+        let attack_step = (1.0 - cfg.gain) / (cfg.attack_ms / 20).max(1) as f32;
+        let release_step = (1.0 - cfg.gain) / (cfg.release_ms / 20).max(1) as f32;
+        if st.speaking {
+            st.hold_left = cfg.hold_ms / 20;
+            st.gain = move_toward(st.gain, cfg.gain, attack_step);
+        } else if st.hold_left > 0 {
+            st.hold_left -= 1;
+        } else {
+            st.gain = move_toward(st.gain, 1.0, release_step);
+        }
+        st.gain
     }
 
     /// Advance one 20 ms tick. Returns
@@ -487,14 +719,18 @@ impl Mixer {
         (to_discord, to_armada)
     }
 
-    /// Sum one direction: all inputs from `source_side` at
-    /// unity, finished with the last-resort hard clamp at
-    /// full scale (the pre-loudness-fix behavior).
+    /// Sum one direction: all inputs from `source_side`,
+    /// each at its effective gain (manual × duck envelope
+    /// for music sources, manual alone for humans — sources
+    /// with no gains set pass at unity, bit-exact), finished
+    /// with the last-resort hard clamp at full scale.
+    /// Frames are popped BEFORE the duck steps so the
+    /// envelope decision for a tick is made on that tick's
+    /// human frames, then applied to that tick's music.
     fn mix_direction(&mut self, source_side: Side) -> Option<Vec<i16>> {
-        let mut acc: Option<[i32; FRAME_SAMPLES]> = None;
-        let mut any_audio = false;
         let keys: Vec<(Side, u64)> =
             self.inputs.keys().filter(|(s, _)| *s == source_side).copied().collect();
+        let mut frames: Vec<((Side, u64), Option<Vec<i16>>)> = Vec::with_capacity(keys.len());
         for key in keys {
             let mut frame = None;
             if let Some(b) = self.inputs.get_mut(&key) {
@@ -511,11 +747,24 @@ impl Mixer {
             if speaking != was {
                 self.speaking_edges.push((key.0, key.1, speaking));
             }
-            if let Some(frame) = frame {
-                any_audio = true;
-                let acc = acc.get_or_insert([0i32; FRAME_SAMPLES]);
+            frames.push((key, frame));
+        }
+        let duck_gain = self.step_duck(source_side, &frames);
+        let mut acc: Option<[i32; FRAME_SAMPLES]> = None;
+        let mut any_audio = false;
+        for (key, frame) in &frames {
+            let Some(frame) = frame else { continue };
+            any_audio = true;
+            let manual = self.manual.get(key).copied().unwrap_or(1.0);
+            let eff = if self.music.contains(key) { manual * duck_gain } else { manual };
+            let acc = acc.get_or_insert([0i32; FRAME_SAMPLES]);
+            if eff == 1.0 {
                 for (i, s) in frame.iter().take(FRAME_SAMPLES).enumerate() {
                     acc[i] += *s as i32;
+                }
+            } else {
+                for (i, s) in frame.iter().take(FRAME_SAMPLES).enumerate() {
+                    acc[i] += (*s as f32 * eff).round() as i32;
                 }
             }
         }
@@ -795,5 +1044,237 @@ mod tests {
         assert_eq!(energy_bucket(&[]), 0);
         assert_eq!(energy_bucket(&vec![0i16; FRAME_SAMPLES]), 0);
         assert_eq!(energy_bucket(&vec![i16::MAX; FRAME_SAMPLES]), 255);
+    }
+
+    // -- ducking + manual gains (2026-11-24) ------------------
+
+    const MUSICBOT: (Side, u64) = (Side::Armada, 0x1CE5);
+    const VOICEBOT: (Side, u64) = (Side::Armada, 0xC4415);
+    const HUMAN: (Side, u64) = (Side::Armada, 0x44);
+
+    fn duck_mixer() -> Mixer {
+        let mut cfg = DuckConfig::default();
+        cfg.music_sources.insert(MUSICBOT);
+        Mixer::with_duck_config(cfg)
+    }
+
+    /// Prefill one source's jitter buffer so it flows.
+    fn prime(m: &mut Mixer, src: (Side, u64), amp: i16) {
+        for _ in 0..JITTER_TARGET {
+            m.push(src.0, src.1, vec![amp; FRAME_SAMPLES]);
+        }
+    }
+
+    /// One tick with one fresh constant frame per listed
+    /// source (steady-state flow).
+    fn feed_tick(m: &mut Mixer, feeds: &[((Side, u64), i16)]) -> (Option<Vec<i16>>, Option<Vec<i16>>) {
+        for (src, amp) in feeds {
+            m.push(src.0, src.1, vec![*amp; FRAME_SAMPLES]);
+        }
+        m.tick()
+    }
+
+    #[test]
+    fn duck_attack_reaches_target_in_about_100ms() {
+        let mut m = duck_mixer();
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, HUMAN, 0);
+        // Nobody speaking: no duck.
+        for _ in 0..3 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 0)]);
+        }
+        assert_eq!(m.duck_gain(Side::Armada), 1.0);
+        // Speech starts. The jitter buffer's steady-state
+        // depth (JITTER_TARGET) means a content switch pops
+        // 3 ticks later — the envelope itself then attacks
+        // over 100 ms = 5 ticks of 0.14.
+        for _ in 0..3 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+            assert_eq!(m.duck_gain(Side::Armada), 1.0, "jitter lag: old frames still popping");
+        }
+        feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+        let g1 = m.duck_gain(Side::Armada);
+        assert!((g1 - 0.86).abs() < 0.001, "first attack tick: {g1}");
+        for _ in 0..4 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+        }
+        let g5 = m.duck_gain(Side::Armada);
+        assert!((g5 - 0.30).abs() < 0.001, "after 5 attack ticks (100 ms): {g5}");
+        // Steady state while speech continues.
+        for _ in 0..10 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+        }
+        assert!((m.duck_gain(Side::Armada) - 0.30).abs() < 0.001);
+    }
+
+    #[test]
+    fn duck_holds_then_releases_on_schedule() {
+        let mut m = duck_mixer();
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, HUMAN, 10_000);
+        for _ in 0..10 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+        }
+        assert!((m.duck_gain(Side::Armada) - 0.30).abs() < 0.001);
+        // Speech stops (silent frames): the duck must HOLD
+        // at target for the full 1500 ms hold (75 ticks of
+        // popped silence, plus the 3-tick jitter lag while
+        // the last loud frames drain)…
+        for _ in 0..78 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 0)]);
+        }
+        assert!(
+            (m.duck_gain(Side::Armada) - 0.30).abs() < 0.001,
+            "still ducked at the end of the hold: {}",
+            m.duck_gain(Side::Armada)
+        );
+        // …then release over 1000 ms (50 ticks): halfway
+        // (25 ticks) ≈ 0.65, fully back at 50.
+        for _ in 0..25 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 0)]);
+        }
+        let mid = m.duck_gain(Side::Armada);
+        assert!((mid - 0.65).abs() < 0.03, "mid-release: {mid}");
+        for _ in 0..25 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 0)]);
+        }
+        let done = m.duck_gain(Side::Armada);
+        assert!((done - 1.0).abs() < 0.001, "fully released after 1000 ms: {done}");
+    }
+
+    #[test]
+    fn duck_hysteresis_band_neither_engages_nor_releases() {
+        // RMS of a constant 500-amp frame ≈ 0.0153: between
+        // rms_off (0.01) and rms_on (0.02).
+        let mut m = duck_mixer();
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, HUMAN, 500);
+        // From idle, band-level noise never engages the duck.
+        for _ in 0..20 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 500)]);
+        }
+        assert_eq!(m.duck_gain(Side::Armada), 1.0);
+        // Real speech engages it…
+        for _ in 0..10 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+        }
+        assert!((m.duck_gain(Side::Armada) - 0.30).abs() < 0.001);
+        // …and falling back INTO the band (not below it)
+        // holds the speech latch: no hold countdown, no
+        // release, for far longer than the hold window.
+        for _ in 0..100 {
+            feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 500)]);
+        }
+        assert!((m.duck_gain(Side::Armada) - 0.30).abs() < 0.001);
+    }
+
+    #[test]
+    fn music_alone_never_ducks_itself() {
+        let mut m = duck_mixer();
+        prime(&mut m, MUSICBOT, 10_000);
+        for _ in 0..30 {
+            let (td, _) = feed_tick(&mut m, &[(MUSICBOT, 10_000)]);
+            assert!(td.unwrap().iter().all(|s| *s == 10_000), "music passes bit-exact with no humans");
+        }
+        assert_eq!(m.duck_gain(Side::Armada), 1.0);
+    }
+
+    #[test]
+    fn non_music_source_is_never_envelope_reduced() {
+        // VOICEBOT is not on the music list. His voice must
+        // pass at full level even while he himself is the
+        // speech that ducks the music beside him — the mix
+        // settles at VoiceBot 10000 + MusicBot 10000×0.30 = 13000,
+        // never a point less for VoiceBot.
+        let mut m = duck_mixer();
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, VOICEBOT, 10_000);
+        for tick in 0..20 {
+            let (td, _) = feed_tick(&mut m, &[(MUSICBOT, 10_000), (VOICEBOT, 10_000)]);
+            let td = td.unwrap();
+            if tick >= 6 {
+                assert!(
+                    td.iter().all(|s| *s == 13_000),
+                    "tick {tick}: human full + music ducked: {:?}…",
+                    &td[..4]
+                );
+            }
+        }
+        // And alone, with the duck fully engaged by his own
+        // earlier speech, a non-music source is bit-exact.
+        let mut m = duck_mixer();
+        prime(&mut m, VOICEBOT, 10_000);
+        for _ in 0..20 {
+            let (td, _) = feed_tick(&mut m, &[(VOICEBOT, 10_000)]);
+            assert!(td.unwrap().iter().all(|s| *s == 10_000));
+        }
+    }
+
+    #[test]
+    fn duck_kill_switch_disables_the_envelope() {
+        let mut cfg = DuckConfig { enabled: false, ..DuckConfig::default() };
+        cfg.music_sources.insert(MUSICBOT);
+        let mut m = Mixer::with_duck_config(cfg);
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, HUMAN, 10_000);
+        for _ in 0..20 {
+            let (td, _) = feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+            assert!(td.unwrap().iter().all(|s| *s == 20_000), "no ducking while disabled");
+        }
+        assert_eq!(m.duck_gain(Side::Armada), 1.0);
+    }
+
+    #[test]
+    fn manual_gain_applies_boosts_and_clamps() {
+        let mut m = Mixer::new();
+        prime(&mut m, (Side::Discord, 1), 10_000);
+        m.set_manual_gain(Side::Discord, 1, 0.5);
+        let (_, ta) = feed_tick(&mut m, &[((Side::Discord, 1), 10_000)]);
+        assert!(ta.unwrap().iter().all(|s| *s == 5_000));
+        m.set_manual_gain(Side::Discord, 1, 1.5);
+        let (_, ta) = feed_tick(&mut m, &[((Side::Discord, 1), 10_000)]);
+        assert!(ta.unwrap().iter().all(|s| *s == 15_000));
+        // Out-of-range requests clamp to the 0–150% window.
+        m.set_manual_gain(Side::Discord, 1, 2.0);
+        assert_eq!(m.manual_gain(Side::Discord, 1), 1.5);
+        m.set_manual_gain(Side::Discord, 1, -1.0);
+        assert_eq!(m.manual_gain(Side::Discord, 1), 0.0);
+        let (_, ta) = feed_tick(&mut m, &[((Side::Discord, 1), 10_000)]);
+        assert!(ta.unwrap().iter().all(|s| *s == 0));
+    }
+
+    #[test]
+    fn manual_gain_resets() {
+        let mut m = Mixer::new();
+        prime(&mut m, (Side::Discord, 1), 10_000);
+        prime(&mut m, (Side::Discord, 2), 10_000);
+        m.set_manual_gain(Side::Discord, 1, 0.5);
+        m.set_manual_gain(Side::Discord, 2, 0.25);
+        m.reset_manual_gain(Side::Discord, 1);
+        assert_eq!(m.manual_gain(Side::Discord, 1), 1.0);
+        assert_eq!(m.manual_gain(Side::Discord, 2), 0.25);
+        let (_, ta) = feed_tick(&mut m, &[((Side::Discord, 1), 10_000), ((Side::Discord, 2), 10_000)]);
+        assert!(ta.unwrap().iter().all(|s| *s == 12_500), "10000 + 2500 after one reset");
+        m.reset_all_manual_gains();
+        assert_eq!(m.manual_gain(Side::Discord, 2), 1.0);
+        let (_, ta) = feed_tick(&mut m, &[((Side::Discord, 1), 10_000), ((Side::Discord, 2), 10_000)]);
+        assert!(ta.unwrap().iter().all(|s| *s == 20_000));
+    }
+
+    #[test]
+    fn manual_and_duck_compose_multiplicatively() {
+        // Music at manual 50% under an engaged duck (30%)
+        // contributes 15%: 10000 × 0.5 × 0.30 = 1500, on
+        // top of the untouched human 10000 → 11500.
+        let mut m = duck_mixer();
+        m.set_manual_gain(MUSICBOT.0, MUSICBOT.1, 0.5);
+        prime(&mut m, MUSICBOT, 10_000);
+        prime(&mut m, HUMAN, 10_000);
+        for tick in 0..20 {
+            let (td, _) = feed_tick(&mut m, &[(MUSICBOT, 10_000), (HUMAN, 10_000)]);
+            if tick >= 6 {
+                assert!(td.unwrap().iter().all(|s| *s == 11_500), "tick {tick}");
+            }
+        }
     }
 }

@@ -32,12 +32,13 @@
 mod auth;
 mod converse;
 mod resolve;
+mod vol;
 
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use pcm_protocol::{
-    fnv1a_64, Frame, FrameType, Mixer, Side, StreamDecoder, FRAME_SAMPLES,
+    fnv1a_64, DuckConfig, Frame, FrameType, Mixer, Side, StreamDecoder, FRAME_SAMPLES,
 };
 use resolve::{
     humans_only, is_voice_channel, resolve_landing, should_end_for_emptiness,
@@ -54,6 +55,19 @@ use tokio::sync::{mpsc, oneshot};
 use vector_sdk::{BotEvent, IncomingMessage, VectorBot};
 
 const EX_CONFIG: i32 = 78;
+
+/// The voice bot's npub (also the ARMADA_BOT_NPUBS
+/// entry in the reference deployment): a friendly stream
+/// label for the volume commands, and — by NOT appearing
+/// in the default music set — a standing guarantee it is
+/// treated as a human by the ducker. Empty in this
+/// snapshot: a deployment bakes in its own bot's npub.
+const VOICE_BOT_NPUB: &str = "";
+/// The music bot's npub: the DEFAULT (and only default)
+/// member of the ducker's music set. Empty in this
+/// snapshot — set JANUS_DUCK_MUSIC_NPUBS in the env file,
+/// or bake the npub in here.
+const MUSIC_BOT_NPUB: &str = "";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -91,6 +105,16 @@ struct Config {
     bridge_name: String,
     selftest_tone: bool,
     speaking_relay: bool,
+    /// Music ducking (JANUS_DUCK_*): envelope parameters +
+    /// the stable-id music seeds (Discord user ids). Armada
+    /// music sources are marked at runtime from
+    /// `duck_music_npubs` once presence resolves a
+    /// participant's random-per-join SFU identity to an
+    /// npub — the identity itself can never be configured.
+    duck: DuckConfig,
+    /// Npubs whose Armada audio is music (JANUS_DUCK_MUSIC_NPUBS,
+    /// default: the music bot alone).
+    duck_music_npubs: HashSet<String>,
 }
 
 impl Config {
@@ -104,6 +128,42 @@ impl Config {
             auth::build_whitelist(owner_npub.as_deref(), env("ARMADA_SUMMON_NPUBS").as_deref());
         let bot_npubs: HashSet<String> =
             auth::parse_id_list(env("ARMADA_BOT_NPUBS").as_deref()).into_iter().collect();
+        // Ducking knobs (JANUS_DUCK_*): every value falls
+        // back to the approved default when unset or
+        // unparseable — a typo in the env file must never
+        // take the bridge down or silently change the mix.
+        let parse_f32 = |k: &str, default: f32| {
+            env(k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(default)
+        };
+        let parse_u32 = |k: &str, default: u32| {
+            env(k).and_then(|v| v.parse::<u32>().ok()).unwrap_or(default)
+        };
+        let mut duck = DuckConfig {
+            enabled: !env("JANUS_DUCK")
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("off"))
+                .unwrap_or(false),
+            gain: parse_f32("JANUS_DUCK_GAIN", DuckConfig::default().gain).clamp(0.05, 1.0),
+            attack_ms: parse_u32("JANUS_DUCK_ATTACK_MS", DuckConfig::default().attack_ms),
+            hold_ms: parse_u32("JANUS_DUCK_HOLD_MS", DuckConfig::default().hold_ms),
+            release_ms: parse_u32("JANUS_DUCK_RELEASE_MS", DuckConfig::default().release_ms),
+            rms_on: parse_f32("JANUS_DUCK_RMS_ON", DuckConfig::default().rms_on),
+            rms_off: parse_f32("JANUS_DUCK_RMS_OFF", DuckConfig::default().rms_off),
+            music_sources: HashSet::new(),
+        };
+        if duck.rms_off >= duck.rms_on {
+            duck.rms_on = DuckConfig::default().rms_on;
+            duck.rms_off = DuckConfig::default().rms_off;
+        }
+        for raw in auth::parse_id_list(env("JANUS_DUCK_MUSIC_DISCORD_IDS").as_deref()) {
+            if let Ok(id) = raw.parse::<u64>() {
+                duck.music_sources.insert((Side::Discord, id));
+            }
+        }
+        let duck_music_npubs: HashSet<String> = match env("JANUS_DUCK_MUSIC_NPUBS") {
+            Some(raw) => auth::parse_id_list(Some(&raw)).into_iter().collect(),
+            None => [MUSIC_BOT_NPUB.to_string()].into_iter().collect(),
+        };
         Self {
             socket_path: env("BRIDGE_SOCKET_PATH")
                 .unwrap_or_else(|| format!("{runtime}/janus/pcm.sock")),
@@ -123,6 +183,8 @@ impl Config {
             bridge_name: env("BRIDGE_NAME_ARMADA").unwrap_or_else(|| "Janus".into()),
             selftest_tone: env("BRIDGE_SELFTEST_TONE").as_deref() == Some("1"),
             speaking_relay: env("SPEAKING_RELAY").as_deref() == Some("on"),
+            duck,
+            duck_music_npubs,
         }
     }
 }
@@ -202,6 +264,12 @@ struct App {
     mixer: Mutex<Mixer>,
     bot: Mutex<Option<VectorBot>>,
     own_pubkey: Mutex<Option<PublicKey>>,
+    /// Display names for the mixer's live sources, for the
+    /// volume commands (vol.rs): Armada sources register
+    /// when presence resolves their identity to an npub,
+    /// Discord sources on their first frame. Labels only —
+    /// the mixer itself never sees names.
+    source_names: Mutex<HashMap<(Side, u64), vol::Candidate>>,
 }
 
 impl App {
@@ -230,14 +298,28 @@ impl App {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cfg = Arc::new(Config::from_env());
-    let mixer = Mixer::new();
-    info!("[janus] audio path: unity passthrough (no gain staging, no limiter; hard clamp at full scale only)");
+    let mixer = Mixer::with_duck_config(cfg.duck.clone());
+    if cfg.duck.enabled {
+        info!(
+            "[janus] audio path: unity passthrough + music ducking ON (the owner, 2026-11-24): music sources -> {:.0}% under same-side speech (attack {} ms, hold {} ms, release {} ms, RMS {}/{}), music npubs {:?}; per-stream manual gains via !vol (the owner only); hard clamp at full scale",
+            cfg.duck.gain * 100.0,
+            cfg.duck.attack_ms,
+            cfg.duck.hold_ms,
+            cfg.duck.release_ms,
+            cfg.duck.rms_on,
+            cfg.duck.rms_off,
+            cfg.duck_music_npubs,
+        );
+    } else {
+        info!("[janus] audio path: unity passthrough (ducking OFF — JANUS_DUCK=off; manual !vol gains still apply; hard clamp at full scale only)");
+    }
     let app = Arc::new(App {
         cfg: cfg.clone(),
         shared: Mutex::new(Shared::new()),
         mixer: Mutex::new(mixer),
         bot: Mutex::new(None),
         own_pubkey: Mutex::new(None),
+        source_names: Mutex::new(HashMap::new()),
     });
 
     if cfg.nsec.is_none() {
@@ -339,6 +421,7 @@ async fn handle_discord_conn(app: Arc<App>, stream: UnixStream) {
                         FrameType::PcmDown => {
                             let samples = frame.pcm_samples();
                             if samples.len() == FRAME_SAMPLES {
+                                register_discord_name(&app, frame.speaker_id);
                                 app.mixer.lock().unwrap().push(Side::Discord, frame.speaker_id, samples);
                             }
                         }
@@ -511,6 +594,33 @@ async fn handle_control(app: Arc<App>, msg: Value) {
             let reason = msg.get("reason").and_then(|r| r.as_str()).unwrap_or("ended from the discord side").to_string();
             end_session(&app, &reason, false).await;
         }
+        Some("vol") => {
+            // Per-stream volume command from the DISCORD
+            // leg (vol.rs matcher, executed here against the
+            // shared mixer). Authorization differs by leg by
+            // the owner's decision (2026-11-24): Armada chat is
+            // owner-only, but ANY Discord user may run these
+            // — so the Discord path executes with the gate
+            // open. The reply (or null, when the text was
+            // not a volume command after all) goes back on
+            // the control plane for the leg to post.
+            let id = msg.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+            let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let candidates = {
+                let mixer = app.mixer.lock().unwrap();
+                let names = app.source_names.lock().unwrap();
+                vol::build_candidates(&mixer, &names)
+            };
+            let outcome = {
+                let mut mixer = app.mixer.lock().unwrap();
+                vol::handle_vol_message(&mut mixer, &candidates, true, &text)
+            };
+            let line = match outcome {
+                vol::VolOutcome::Reply(line) => Some(line),
+                _ => None,
+            };
+            app.send_control(json!({ "cmd": "vol_reply", "id": id, "line": line }));
+        }
         Some("status_request") => app.push_status(),
         other => warn!("[janus] unknown control cmd: {other:?}"),
     }
@@ -581,14 +691,39 @@ async fn start_armada_leg(app: &Arc<App>, channel_id: &str, channel_name: &str, 
         .clone()
         .context("armada identity not configured (ARMADA_BRIDGE_NSEC)")?;
     let leg = concord_voice::spawn_leg(channel_id.to_string(), author);
-    let concord_voice::Leg { stop, pcm_in, mut pcm_out, observed: _, task } = leg;
+    let concord_voice::Leg { stop, pcm_in, mut pcm_out, observed, task } = leg;
 
     // Inbound participant frames -> mixer (Armada side).
+    // The SFU identity is a random per-join string, so the
+    // npub behind it is resolved through the leg's presence
+    // identity map (claims land up to ~25 s after a join;
+    // misses are retried on later frames, only successes
+    // are cached). A resolved npub registers the source's
+    // display name for the volume commands and — when the
+    // npub is a configured music npub — marks the source
+    // as music for the ducker.
     {
         let app = app.clone();
         tokio::spawn(async move {
+            let mut resolved: HashSet<String> = HashSet::new();
             while let Some((identity, frame)) = pcm_out.recv().await {
-                app.mixer.lock().unwrap().push(Side::Armada, fnv1a_64(&identity), frame);
+                let speaker = fnv1a_64(&identity);
+                if !resolved.contains(&identity) {
+                    let npub = observed
+                        .identities
+                        .lock()
+                        .unwrap()
+                        .npub_of(&identity, concord_voice::util::now_ms());
+                    if let Some(npub) = npub {
+                        register_armada_name(&app, speaker, &npub);
+                        if app.cfg.duck_music_npubs.contains(&npub) {
+                            app.mixer.lock().unwrap().set_music_source(Side::Armada, speaker, true);
+                            info!("[janus] ducking: {npub} is a music source this session (identity {identity})");
+                        }
+                        resolved.insert(identity.clone());
+                    }
+                }
+                app.mixer.lock().unwrap().push(Side::Armada, speaker, frame);
             }
         });
     }
@@ -678,6 +813,7 @@ async fn end_session(app: &Arc<App>, reason: &str, notify_discord: bool) {
         stop.store(true, Ordering::Relaxed);
     }
     app.mixer.lock().unwrap().clear();
+    app.source_names.lock().unwrap().clear();
     if was_live {
         info!("[janus] session ended: {reason}");
         if notify_discord {
@@ -686,6 +822,62 @@ async fn end_session(app: &Arc<App>, reason: &str, notify_discord: bool) {
         announce(app, false).await;
         app.push_status();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream names for the volume commands (vol.rs)
+// ---------------------------------------------------------------------------
+
+/// Register an Armada source's display name from its
+/// resolved npub: friendly names for the regulars (the owner,
+/// VoiceBot, MusicBot), a truncated npub for everyone else. The
+/// haystack carries the full npub so `!vol` can match any
+/// unique fragment of it.
+fn register_armada_name(app: &App, speaker: u64, npub: &str) {
+    let label = if app.cfg.owner_npub.as_deref() == Some(npub) {
+        "Owner".to_string()
+    } else if npub == VOICE_BOT_NPUB {
+        "VoiceBot".to_string()
+    } else if npub == MUSIC_BOT_NPUB {
+        "MusicBot".to_string()
+    } else {
+        format!("{}…", &npub[..10.min(npub.len())])
+    };
+    let token = label.to_lowercase();
+    let meta = vol::Candidate {
+        side: Side::Armada,
+        id: speaker,
+        haystack: format!("{token} {npub}"),
+        label,
+        token,
+    };
+    app.source_names.lock().unwrap().insert((Side::Armada, speaker), meta);
+}
+
+/// Register a Discord source's display name on first
+/// sight. The Rust side never learns Discord display names
+/// (the socket protocol carries user ids only), so the
+/// label is the id's last 6 digits — unique in practice,
+/// and matchable both as a label fragment and by the full
+/// id in the haystack.
+fn register_discord_name(app: &App, id: u64) {
+    let key = (Side::Discord, id);
+    let mut names = app.source_names.lock().unwrap();
+    if names.contains_key(&key) {
+        return;
+    }
+    let s = id.to_string();
+    let last6 = &s[s.len().saturating_sub(6)..];
+    names.insert(
+        key,
+        vol::Candidate {
+            side: Side::Discord,
+            id,
+            label: format!("Discord {last6}"),
+            haystack: format!("discord {last6} {s}"),
+            token: last6.to_string(),
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1113,33 @@ async fn handle_chat_message(app: Arc<App>, _bot: VectorBot, msg: IncomingMessag
     let channel = msg.channel();
     const DENIAL: &str =
         "Bridge summon and leave are for whitelisted members only — ask the owner to add your npub to the whitelist.";
+
+    // Per-stream volume commands first (!vol … and the
+    // conversational forms — vol.rs). OWNER-ONLY: from
+    // anyone else a volume-shaped message is swallowed
+    // silently (no reply, no state change, and NOT the
+    // summon denial below), and a volume message from
+    // the owner is answered here and never reaches the summon
+    // matcher.
+    {
+        let candidates = {
+            let mixer = app.mixer.lock().unwrap();
+            let names = app.source_names.lock().unwrap();
+            vol::build_candidates(&mixer, &names)
+        };
+        let outcome = {
+            let mut mixer = app.mixer.lock().unwrap();
+            vol::handle_vol_message(&mut mixer, &candidates, is_owner, &text)
+        };
+        match outcome {
+            vol::VolOutcome::Reply(line) => {
+                let _ = channel.send(&line).await;
+                return;
+            }
+            vol::VolOutcome::Silent => return,
+            vol::VolOutcome::NotVolume => {}
+        }
+    }
 
     // Resolve the message to an action: explicit `!` commands
     // first (backstops), then the conversational matcher.
